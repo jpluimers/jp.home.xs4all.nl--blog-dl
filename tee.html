@@ -1,0 +1,214 @@
+The<a href="http://en.wikipedia.org/wiki/Tee_(command)" target="_blank">tee</a> command stems from a <a href="http://en.wikipedia.org/wiki/Unix-like" target="_blank">*nix</a> background.<a href="http://en.wikipedia.org/wiki/File:Tee.svg"><img class="alignright" title="The usage of tee" src="http://upload.wikimedia.org/wikipedia/commons/thumb/2/24/Tee.svg/400px-Tee.svg.png" alt="" width="400" height="253" /></a>
+It is a <a href="http://en.wikipedia.org/wiki/Command-line_interpreter" target="_blank">command-line</a> <a href="http://en.wikipedia.org/wiki/Filter_(Unix)" target="_blank">filter</a> that allows you to deviate a <a href="http://en.wikipedia.org/wiki/Stream_(computing)" target="_blank">stream</a> from the regular <a href="http://en.wikipedia.org/wiki/Standard_streams" target="_blank">stdout/stdin</a> <a href="http://en.wikipedia.org/wiki/Redirection_(computing)" target="_blank">redirected</a> <a href="http://en.wikipedia.org/wiki/Pipeline_(Unix)" target="_blank">pipeline</a> into a file.
+
+Recently, I needed this in a <a href="http://en.wikipedia.org/wiki/Windows_Embedded#Windows_Embedded_Standard" target="_blank">Windows Embedded Stadard</a> (<a href="http://en.wikipedia.org/wiki/Aka" target="_blank">a.k.a.</a> WES) system for logging purposes.
+This way, a post-install-script (similar to the <a href="http://en.wikipedia.org/wiki/Windows_Post-Install_Wizard" target="_blank">Windows Post-Install Wizard</a>, but command-line based) could log to both the console and a log-file at the same time.
+
+WES is the successor <a href="http://en.wikipedia.org/wiki/Windows_XP_editions#Windows_XP_Embedded" target="_blank">Windows XP Embedded</a> (a.k.a. XPe), which is a modularized version of <a href="http://en.wikipedia.org/wiki/Windows_XP" target="_blank">Windows XP</a>.
+Se WES usually means that you don't have the luxury of everything that Windows XP has.
+This in turn means that you need to be careful when selecting external tools: a lot of stuff that works on plain Windows XP won't work.
+
+There are various <a href="http://www.google.nl/search?q=tee+win32" target="_blank">Win32 ports of tee</a> available.
+This time however, I needed a <a href="http://en.wikipedia.org/wiki/Unicode" target="_blank">Unicode</a> implementation, so I searched for a <a href="http://en.wikipedia.org/wiki/.NET_Framework" target="_blank">.NET</a> based implementation.
+
+<a href="http://en.wikipedia.org/wiki/Windows_PowerShell#PowerShell_2.0" target="_blank">Windows PowerShell 2.0</a> does<a href="http://technet.microsoft.com/en-us/library/dd347705.aspx" target="_blank">contain a tee implementation</a>, but:
+<ol>
+	<li>We don't have the luxury of having PowerShell in our WES image</li>
+	<li><a href="http://en.wikipedia.org/wiki/Tee_(command)#Windows_PowerShell_2" target="_blank">PowerShell tee first writes the contents to e temporary file</a>, which interferes with how we build this WES image.</li>
+</ol>
+Luckily <a href="http://www.chipstips.com/?page_id=2" target="_blank">Sterling W. Chip Camden</a> started with such a .NET <a href="http://www.chipstips.com/?p=129" target="_blank">implementation of tee - in Visual C++</a> - back in 2005.
+Though his TEE page indicates it is based on .NET 1.1, his current implementation is done in Visual Studio 2008 using <a href="http://en.wikipedia.org/wiki/C%2B%2B" target="_blank">C++</a>.
+
+Now that is a problem for the targeted WES image: that image is based on .NET 2.0.
+But when using Visual C++ in .NET, you need additional run-time libraries (for instance <a href="http://www.microsoft.com/downloads/details.aspx?familyid=32bc1bee-a3f9-4c13-9c99-220b62a191ee&amp;displaylang=en" target="_blank">the ones for Visual C++ 2005</a>, or <a href="http://www.microsoft.com/downloads/details.aspx?familyid=A5C84275-3B97-4AB7-A40D-3802B2AF5FC2&amp;displaylang=en" target="_blank">the ones for Visual C++ 2008</a>).
+
+If you don't have these installed, tee.exe does not start, and you get entries like this in the Eventlog:
+<blockquote>Event Type:	Error
+Event Source:	SideBySide
+Event Category:	None
+Event ID:	59
+Date:		01/04/2010
+Time:		19:09:22
+User:		N/A
+Computer:	MYMACHINE
+Description:
+<a href="http://www.google.com/search?q=59+&quot;generate+activation+context+failed&quot;" target="_blank"> Generate Activation Context failed</a> for K:\Post-Install-Scripts\tee.exe. Reference error message: <strong>The operation completed successfully</strong>.</blockquote>
+The odd thing in this error message is <em>"The operation completed successfully"</em>: it didn't :-)
+
+Anyway: translating the underlying C++ code to C# is pretty straightforward, so:
+<h1>The C# implementation</h1>
+I did change a few things, none of them major:
+<ul>
+	<li>replaced some for statements with foreach</li>
+	<li>renamed a few variables to make them more readable</li>
+	<li>added using statements for stdin and stdout</li>
+	<li>added try...finally for cleaning up the binary writers</li>
+	<li>moved the logic for duplicate filenames into a separate method, and moved the moment of checking to the point of adding the filename to the filenames</li>
+	<li>moved the help into a separate method</li>
+	<li>added support for the -h (same behaviour as --help or /?)command-lineargument</li>
+</ul>
+[sourcecode language='C#']
+using System;
+using System.IO;
+using System.Collections.Generic;
+// Sends standard input to standard output and to all files in command line.
+// C# implementation april 4th, 2010 by Jeroen Wiert Pluimers (http://wiert.wordpress.com),
+// based on tee Chip Camden, Camden Software Consulting, November 2005
+// 	... and Anonymous Cowards everywhere!
+//
+// TEE [-a | --append] [-i | --ignore] [--help | /?] [-f] [file1] [...]
+//    Example:
+// 	tee --append file0.txt -f --help file2.txt
+//    will append to file0.txt, --help, and file2.txt
+//
+// -a | --append	Appends files instead of overwriting
+// 			  (setting is per tee instance)
+// -i | --ignore	Ignore cancel Ctrl+C keypress: see UnixUtils tee
+// /? | --help		Displays this message and immediately quits
+// -f			Stop recognizing flags, force all following filenames literally
+//
+// Duplicate filenames are quietly ignored.
+// Press Ctrl+Z (End of File character) then Enter to abort.
+namespace tee
+{
+    class Program
+    {
+        static void help()
+        {
+            Console.Error.WriteLine("Sends standard input to standard output and to all files in command line.");
+            Console.Error.WriteLine("C# implementation april 4th, 2010 by Jeroen Wiert Pluimers (http://wiert.wordpress.com),");
+            Console.Error.WriteLine("Chip Camden, Camden Software Consulting, November 2005");
+            Console.Error.WriteLine("	... and Anonymous Cowards everywhere!");
+            Console.Error.WriteLine("http://www.camdensoftware.com");
+            Console.Error.WriteLine("http://chipstips.com/?tag=cpptee");
+            Console.Error.WriteLine("");
+            Console.Error.WriteLine("tee [-a | --append] [-i | --ignore] [--help | /?] [-f] [file1] [...]");
+            Console.Error.WriteLine("   Example:");
+            Console.Error.WriteLine(" tee --append file0.txt -f --help file2.txt");
+            Console.Error.WriteLine("   will append to file0.txt, --help, and file2.txt");
+            Console.Error.WriteLine("");
+            Console.Error.WriteLine("-a | --append    Appends files instead of overwriting");
+            Console.Error.WriteLine("                 (setting is per tee instance)");
+            Console.Error.WriteLine("-i | --ignore    Ignore cancel Ctrl+C keypress: see UnixUtils tee");
+            Console.Error.WriteLine("/? | --help      Displays this message and immediately quits");
+            Console.Error.WriteLine("-f               Stop recognizing flags, force all following filenames literally");
+            Console.Error.WriteLine("");
+            Console.Error.WriteLine("Duplicate filenames are quietly ignored.");
+            Console.Error.WriteLine("Press Ctrl+Z (End of File character) then Enter to abort.");
+        }
+
+        static void OnCancelKeyPressed(Object sender, ConsoleCancelEventArgs args)
+        {
+            // Set the Cancel property to true to prevent the process from
+            // terminating.
+            args.Cancel = true;
+        }
+
+        static List<String> filenames = new List<String>();
+
+        static void addFilename(string value)
+        {
+            if (-1 == filenames.IndexOf(value))
+                filenames.Add(value);
+        }
+
+        static int Main(string[] args)
+        {
+            try
+            {
+                bool appendToFiles = false;
+                bool stopInterpretingFlags = false;
+                bool ignoreCtrlC = false;
+
+                foreach (string arg in args)
+                {
+                    //Since we're already parsing.... might as well check for flags:
+                    if (stopInterpretingFlags)  //Stop interpreting flags, assume is filename
+                    {
+                        addFilename(arg);
+                    }
+                    else if (arg.Equals("/?") || arg.Equals("-h") || arg.Equals("--help"))
+                    {
+                        help();
+                        return 1; //Quit immediately
+                    }
+                    else if (arg.Equals("-a") || arg.Equals("--append"))
+                    {
+                        appendToFiles = true;
+                    }
+                    else if (arg.Equals("-i") || arg.Equals("--ignore"))
+                    {
+                        ignoreCtrlC = true;
+                    }
+                    else if (arg.Equals("-f"))
+                    {
+                        stopInterpretingFlags = true;
+                    }
+                    else
+                    {	//If it isn't any of the above, it's a filename
+                        addFilename(arg);
+                    }
+                    //Add more flags as necessary, just remember to SKIP adding them to the file processing stream!
+                }
+
+                if (ignoreCtrlC) //Implement the Ctrl+C fix selectively (mirror UnixUtils tee behavior)
+                    Console.CancelKeyPress += new ConsoleCancelEventHandler(OnCancelKeyPressed);
+
+                List<BinaryWriter> binaryWriters = new List<BinaryWriter>(filenames.Count); //Add only as many streams as there are distinct files
+                try
+                {
+                    foreach (String filename in filenames)
+                    {
+                        binaryWriters.Add(new BinaryWriter(appendToFiles ?
+                            File.AppendText(filename).BaseStream :
+                            File.Create(filename)));  // Open the files specified as arguments
+                    }
+                    using (BinaryReader stdin = new BinaryReader(Console.OpenStandardInput()))
+                    {
+                        using (BinaryWriter stdout = new BinaryWriter(Console.OpenStandardOutput()))
+                        {
+                            Byte b;
+                            while (true)
+                            {
+                                try
+                                {
+                                    b = stdin.ReadByte();  // Read standard in
+                                }
+                                catch (EndOfStreamException)
+                                {
+                                    break;
+                                }
+                                // The actual tee:
+                                stdout.Write(b); // Write standard out
+                                foreach (BinaryWriter binaryWriter in binaryWriters)
+                                {
+                                    binaryWriter.Write(b); // Write to each file
+                                }
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    foreach (BinaryWriter binaryWriter in binaryWriters)
+                    {
+                        binaryWriter.Flush();  // Flush and close each file
+                        binaryWriter.Close();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(String.Concat("tee: ", ex.Message));  // Send error messages to stderr
+            }
+
+            return 0;
+        }
+    }
+}
+[/sourcecode]
+
+Some alternatives that might (or might not) support unicode:
+
+http://www.commandline.co.uk/mtee/
+http://unxutils.sourceforge.net/ (cannot be downloaded any more - pitty, as they were pretty good)
